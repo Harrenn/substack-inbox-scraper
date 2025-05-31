@@ -1,281 +1,219 @@
-import asyncio
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 import os
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, timedelta
+import sys
+import asyncio
 import re
+from datetime import datetime, timedelta
+from urllib.parse import urljoin
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
-# --- Configuration ---
-USER_DATA_DIR = "./playwright_user_data"
-INBOX_URL = "https://substack.com/inbox"
-BASE_URL_FOR_JOINING = "https://substack.com"
+# Simple file paths (in current directory)
+USER_DATA_DIR = "playwright_user_data"
+SESSION_FLAG = "logged_in.flag"
+DATE_FILE = "date.txt"
+DATA_DIR = "data"
 
-ASSUME_LOGGED_IN = True
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-ENABLE_DATE_FILTER_CONFIG = True
-DATE_FILTER_QUERY_CONFIG = "LAST 7 DAYS" # Example: Last 7 days
-# DATE_FILTER_QUERY_CONFIG = "05-20 TO 05-25"
-# DATE_FILTER_QUERY_CONFIG = None
+# ------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
 
+def is_logged_in():
+    return os.path.exists(SESSION_FLAG)
 
-if not ASSUME_LOGGED_IN and not os.path.exists(USER_DATA_DIR):
-    os.makedirs(USER_DATA_DIR)
-    print(f"Created user data directory: {USER_DATA_DIR}")
-
-def parse_date_string_flexible(date_str, reference_year):
-    formats_to_try = [
-        "%Y-%m-%d", "%m-%d", "%b %d", "%B %d", "%b %d, %Y", "%B %d, %Y",
-    ]
-    for fmt in formats_to_try:
+def set_logged_in(flag: bool):
+    if flag:
+        with open(SESSION_FLAG, "w", encoding="utf-8") as f:
+            f.write("true")
+    else:
         try:
-            dt_obj = datetime.strptime(date_str, fmt)
-            if "%Y" not in fmt:
-                dt_obj = dt_obj.replace(year=reference_year)
-            return dt_obj.date()
-        except ValueError:
-            continue
+            os.remove(SESSION_FLAG)
+        except FileNotFoundError:
+            pass
+
+def load_date_filter():
+    if os.path.exists(DATE_FILE):
+        return open(DATE_FILE, encoding="utf-8").read().strip() or None
     return None
 
-async def scrape_substack_inbox_playwright_extract_v5(): # Renamed
-    articles_data = []
-    effective_enable_date_filter = ENABLE_DATE_FILTER_CONFIG
+def save_date_filter(s: str):
+    with open(DATE_FILE, "w", encoding="utf-8") as f:
+        f.write(s.strip())
 
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=True, # Set to True for background, False for debugging
-            slow_mo=20 # Can be reduced if stable
-        )
-        page = await context.new_page()
+# ------------------------------------------------------------
+# Login / Logout Flows
+# ------------------------------------------------------------
+def login_flow():
+    clear_screen()
+    print("== LOGIN / RE-AUTHENTICATE ==")
+    input("A Chromium window will open. Log in, then press Enter…")
+    async def _do():
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(
+                USER_DATA_DIR, headless=False, slow_mo=100
+            )
+            page = await ctx.new_page()
+            await page.goto("https://substack.com/inbox")
+            input("Once inbox is visible, press Enter…")
+            await ctx.close()
+    asyncio.run(_do())
+    set_logged_in(True)
+    print("✅ Login saved.")
+    input("Press Enter to continue…")
 
-        print(f"Navigating to Substack inbox: {INBOX_URL}")
-        try:
-            await page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=60000)
-        except PlaywrightTimeoutError:
-            print(f"Timeout initially navigating to {INBOX_URL}.")
-        print(f"Current URL: {page.url}")
+def logout_flow():
+    clear_screen()
+    set_logged_in(False)
+    print("✅ Logged out.")
+    input("Press Enter to continue…")
 
-        if not ASSUME_LOGGED_IN:
-            print("-" * 50)
-            print("ASSUME_LOGGED_IN is False. Please MANUALLY LOG IN and NAVIGATE to your inbox.")
-            input(f"Once logged in AND on {INBOX_URL}, press Enter here to continue...")
-            print("-" * 50)
-        else:
-            print("ASSUME_LOGGED_IN is True. Skipping manual login prompt.")
-            if INBOX_URL not in page.url:
-                print(f"Not on inbox. Navigating to {INBOX_URL}...")
-                try:
-                    await page.goto(INBOX_URL, wait_until="networkidle", timeout=30000)
-                except PlaywrightTimeoutError:
-                    print(f"Timeout navigating to inbox again.")
-            print(f"Successfully on inbox page: {page.url}")
-        
-        await asyncio.sleep(0.5) # Shorter pause
-
-        print("Attempting to set sort filter to 'Recent'...")
-        try:
-            sort_dropdown_selector = "select.sort-lAhhIt"
-            sort_dropdown = page.locator(sort_dropdown_selector)
-            if await sort_dropdown.is_visible(timeout=10000):
-                current_value = await sort_dropdown.evaluate("element => element.value")
-                if current_value != "recent":
-                    print("Found sort dropdown. Selecting 'Recent'...")
-                    await sort_dropdown.select_option(value="recent")
-                    print("Selected 'recent' option.")
-                    article_container_selector = "div.reader2-post-container" # Main article container
-                    print(f"Waiting for content to update (waiting for: '{article_container_selector}')...")
-                    await page.wait_for_selector(article_container_selector, state="visible", timeout=30000)
-                    print("'Recent' articles list seems loaded.")
-                else:
-                    print("Sort filter already set to 'Recent'.")
-            else:
-                print(f"Could not find/see dropdown: '{sort_dropdown_selector}'.")
-        except Exception as e:
-            print(f"Error with 'Recent' sort filter: {e}")
-        
-        await asyncio.sleep(1) # Shorter pause
-
-
-        print("Extracting articles...")
-        article_item_selector = "div.reader2-post-container" # Main selector for each article card
-        article_elements = page.locator(article_item_selector)
-        count = await article_elements.count()
-        print(f"Found {count} potential article elements with: '{article_item_selector}'")
-
-        today_date = datetime.now().date()
-        filter_start_date, filter_end_date = None, None
-
-        if effective_enable_date_filter and DATE_FILTER_QUERY_CONFIG:
-            # ... (Date Filter Query Parsing - same as v4) ...
-            query = DATE_FILTER_QUERY_CONFIG.strip().upper()
-            print(f"Applying date filter query: {query}")
-            last_n_days_match = re.match(r"LAST (\d+) DAYS", query)
-            between_match = re.match(r"(.+?) TO (.+)", query)
-            if last_n_days_match:
-                days = int(last_n_days_match.group(1))
-                filter_start_date = today_date - timedelta(days=days -1)
-                filter_end_date = today_date
-                print(f"Filtering for last {days} days: {filter_start_date.isoformat()} to {filter_end_date.isoformat()}")
-            elif between_match:
-                start_str, end_str = between_match.group(1).strip(), between_match.group(2).strip()
-                filter_start_date = parse_date_string_flexible(start_str, today_date.year)
-                filter_end_date = parse_date_string_flexible(end_str, today_date.year)
-                if not (filter_start_date and filter_end_date and filter_start_date <= filter_end_date):
-                    print(f"Warning: Invalid range: '{start_str}' TO '{end_str}'. Disabling date filter.")
-                    effective_enable_date_filter = False
-                else:
-                    print(f"Filtering BETWEEN {filter_start_date.isoformat()} AND {filter_end_date.isoformat()}")
-            else: 
-                filter_start_date = parse_date_string_flexible(query, today_date.year)
-                filter_end_date = filter_start_date
-                if not filter_start_date:
-                    print(f"Warning: Could not parse single date query: '{query}'. Disabling date filter.")
-                    effective_enable_date_filter = False
-                else:
-                    print(f"Filtering for single date: {filter_start_date.isoformat()}")
-        else:
-            print("Date filtering is disabled or no query provided.")
-            effective_enable_date_filter = False
-
-
-        for i in range(count):
-            article_element = article_elements.nth(i)
-            
-            # Locators within each article_element
-            link_locator = article_element.locator("a.linkRowA-pQXF7n")
-            if not await link_locator.count(): # Fallback
-                link_locator = article_element.locator("a[href*='/p/']").first
-            
-            title_locator = article_element.locator("div.reader2-post-title")
-            date_locator = article_element.locator("div.inbox-item-timestamp")
-            
-            # --- NEW: Substack Name Locator ---
-            # Based on HTML: <div class="pub-name"><a>SUBSTACK NAME</a></div>
-            # It's a child of div.reader2-post-head, which is a child of the main link_locator context usually
-            # Or a direct child of article_element if link_locator is not the main wrapper for everything.
-            # Let's assume it's within the broader article_element context for simplicity here.
-            substack_name_locator = article_element.locator("div.pub-name a") # Targets the <a> inside div.pub-name
-            # Alternative, if div.pub-name itself has the text directly (less likely from your HTML):
-            # substack_name_locator = article_element.locator("div.pub-name")
-
-            article_date_for_filtering = None
-
-            try:
-                href_val = await link_locator.get_attribute("href")
-                title_text_val = await title_locator.text_content()
-                
-                article_date_str_on_page = None
-                if await date_locator.count() > 0:
-                    article_date_str_on_page = (await date_locator.first.text_content()).strip()
-
-                substack_name_val = "N/A" # Default if not found
-                if await substack_name_locator.count() > 0:
-                    substack_name_val = (await substack_name_locator.first.text_content()).strip()
-
-
-                if href_val and title_text_val:
-                    href_val = href_val.strip()
-                    title_text_val = title_text_val.strip()
-
-                    if '/p/' in href_val:
-                        # --- Article Date Parsing (from webpage) ---
-                        if article_date_str_on_page:
-                            # ... (Date parsing logic for article_date_for_filtering - same as v4) ...
-                            if ":" in article_date_str_on_page and \
-                               ("AM" in article_date_str_on_page.upper() or "PM" in article_date_str_on_page.upper()):
-                                article_date_for_filtering = today_date
-                            elif "yesterday" in article_date_str_on_page.lower():
-                                article_date_for_filtering = today_date - timedelta(days=1)
-                            else:
-                                parsed_web_date = parse_date_string_flexible(article_date_str_on_page, today_date.year)
-                                if parsed_web_date:
-                                    if parsed_web_date.month > today_date.month and \
-                                       (parsed_web_date.month - today_date.month > 6) and \
-                                       parsed_web_date.year == today_date.year :
-                                        article_date_for_filtering = parsed_web_date.replace(year=today_date.year - 1)
-                                    else:
-                                        article_date_for_filtering = parsed_web_date
-                                else:
-                                    print(f"Could not parse web date: '{article_date_str_on_page}' for '{title_text_val}'")
-
-                        # --- Apply Date Filter ---
-                        if effective_enable_date_filter:
-                            # ... (Date filtering logic - same as v4) ...
-                            if not article_date_for_filtering:
-                                continue 
-                            if filter_start_date and filter_end_date: 
-                                if not (filter_start_date <= article_date_for_filtering <= filter_end_date):
-                                    continue
-                            elif not filter_start_date and not filter_end_date and DATE_FILTER_QUERY_CONFIG:
-                                print(f"Skipping '{title_text_val}' as date query '{DATE_FILTER_QUERY_CONFIG}' was invalid.")
-                                continue
-
-                        full_url = urljoin(BASE_URL_FOR_JOINING, href_val)
-                        articles_data.append({
-                            "substack_name": substack_name_val, # Added
-                            "title": title_text_val, 
-                            "url": full_url, 
-                            "date_str_on_page": article_date_str_on_page, 
-                            "parsed_article_date": article_date_for_filtering.isoformat() if article_date_for_filtering else "N/A"
-                        })
-            except PlaywrightError as e:
-                # print(f"Error extracting from article element {i}: {e}") # Verbose error
-                # print(f"HTML for element {i}: {await article_element.inner_html()}")
-                continue # Skip this article if essential parts are missing
-        
-        print("Finished extracting.")
-        # ... (logging for extraction results) ...
-        if not articles_data and count > 0:
-             print("Elements found, but no articles passed filters or had valid data. Check filters and selectors.")
-        elif not articles_data and count == 0:
-            print("No article elements found. Check `article_item_selector`.")
-
-
-        await context.close()
-        return articles_data
-
-if __name__ == "__main__":
-    extracted_data = asyncio.run(scrape_substack_inbox_playwright_extract_v5())
-
-    # 1) Print to terminal as before
-    if extracted_data:
-        print(f"\n--- Extracted {len(extracted_data)} Articles (after filters) ---")
-        for article in extracted_data:
-            print(f"Substack: {article['substack_name']}")
-            print(f"Title: {article['title']}")
-            print(f"URL: {article['url']}")
-            print(f"Date on Page: {article['date_str_on_page']} (Parsed as: {article['parsed_article_date']})")
-            print("-" * 20)
+# ------------------------------------------------------------
+# Date Filter Flow
+# ------------------------------------------------------------
+def set_date_flow():
+    clear_screen()
+    print("== SET DATE FILTER ==")
+    print("Allowed: 'LAST N DAYS', 'MM-DD', 'MM-DD TO MM-DD'")
+    current = load_date_filter() or "None"
+    s = input(f"Enter date filter (blank to clear) [{current}]: ").strip()
+    if not s:
+        save_date_filter("")
+        print("Filter cleared.")
     else:
-        print("\nNo data was extracted or passed filters.")
+        up = s.upper()
+        valid = bool(
+            re.match(r"LAST \d+ DAYS", up)
+            or re.match(r"\d{1,2}-\d{1,2}$", up)
+            or re.match(r"\d{1,2}-\d{1,2}\s+TO\s+\d{1,2}-\d{1,2}$", up)
+        )
+        if valid:
+            save_date_filter(s)
+            print(f"Filter set to '{s}'")
+        else:
+            print("Invalid format.")
+    input("Press Enter to continue…")
 
-    # 2) ALSO dump to a CSV file named UR_<YYYYMMDD-HHMM>.csv
-    import csv
-    from datetime import datetime
+# ------------------------------------------------------------
+# Extraction Flow
+# ------------------------------------------------------------
+def extract_flow():
+    clear_screen()
+    print("== EXTRACTING ARTICLES ==")
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M")
-    filename = f"UR_{ts}.csv"
-    try:
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            # Header row
-            writer.writerow([
-                "substack_name",
-                "title",
-                "url",
-                "date_on_page",
-                "parsed_date"
-            ])
-            # Data rows
-            for a in extracted_data:
-                writer.writerow([
-                    a["substack_name"],
-                    a["title"],
-                    a["url"],
-                    a["date_str_on_page"],
-                    a["parsed_article_date"]
-                ])
-        print(f"\nSaved extracted articles to file: {filename}")
-    except Exception as e:
-        print(f"\nFailed to write output file {filename}: {e}")
+    logged = is_logged_in()
+    if not logged:
+        print("Not logged in.")
+        if input("Proceed anyway? (y/N): ").strip().lower() != 'y':
+            return
+    date_filter = load_date_filter()
+    use_filter = bool(date_filter)
+    if use_filter:
+        print(f"Using date filter: {date_filter}")
 
+    async def _scrape():
+        today = datetime.now().date()
+        year = today.year
+        start = end = None
+        if use_filter:
+            q = date_filter.strip().upper()
+            m = re.match(r"LAST (\d+) DAYS", q)
+            if m:
+                n = int(m.group(1))
+                start, end = today - timedelta(days=n-1), today
+            else:
+                parts = re.match(r"(.+?) TO (.+)", q)
+                if parts:
+                    start = datetime.strptime(parts.group(1), "%m-%d").replace(year=year).date()
+                    end   = datetime.strptime(parts.group(2), "%m-%d").replace(year=year).date()
+                else:
+                    d = datetime.strptime(q, "%m-%d").replace(year=year).date()
+                    start = end = d
+        articles = []
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(
+                USER_DATA_DIR, headless=True, slow_mo=20
+            )
+            page = await ctx.new_page()
+            await page.goto("https://substack.com/inbox", timeout=60000)
+            try:
+                await page.wait_for_selector("div.reader2-post-container", timeout=30000)
+            except PlaywrightTimeoutError:
+                await ctx.close()
+                return []
+            conts = page.locator("div.reader2-post-container")
+            total = await conts.count()
+            for i in range(total):
+                el = conts.nth(i)
+                href = await el.locator("a.linkRowA-pQXF7n").get_attribute("href") or ""
+                title = (await el.locator("div.reader2-post-title").text_content() or "").strip()
+                date_raw = (await el.locator("div.inbox-item-timestamp").text_content() or "").strip()
+                name = (await el.locator("div.pub-name a").text_content() or "N/A").strip()
+                if not href or not title:
+                    continue
+                # parse date
+                if ":" in date_raw.lower():
+                    art_date = today
+                elif "yesterday" in date_raw.lower():
+                    art_date = today - timedelta(days=1)
+                else:
+                    art_date = datetime.strptime(date_raw, "%b %d").replace(year=year).date()
+                # filter
+                if use_filter and art_date:
+                    if not (start <= art_date <= end):
+                        continue
+                full_url = urljoin("https://substack.com", href)
+                articles.append({
+                    "date": art_date.isoformat(),
+                    "name": name,
+                    "title": title,
+                    "url": full_url
+                })
+            await ctx.close()
+        return articles
+
+    data = asyncio.run(_scrape())
+    if not data:
+        print("No articles.")
+        input("Press Enter…")
+        return
+    # Save to TXT
+    fn = os.path.join(DATA_DIR, f"UR_{datetime.now().strftime('%Y%m%d-%H%M')}.txt")
+    with open(fn, "w", encoding="utf-8") as f:
+        for a in data:
+            f.write(f"{a['date']} | {a['name']} | {a['title']} | {a['url']}\n")
+    print(f"Saved to {fn}")
+    input("Press Enter…")
+
+# ------------------------------------------------------------
+# Main Menu
+# ------------------------------------------------------------
+def main():
+    while True:
+        clear_screen()
+        logged = is_logged_in()
+        df = load_date_filter() or "None"
+        print("=== Substack Scraper ===")
+        print(f"1. {'Logout' if logged else 'Login'}")
+        print(f"2. Set Date Filter (Current: {df})")
+        print("3. Extract Articles")
+        print("4. Exit")
+        choice = input("Choose [1-4]: ").strip()
+        if choice == '1':
+            logout_flow() if logged else login_flow()
+        elif choice == '2':
+            set_date_flow()
+        elif choice == '3':
+            extract_flow()
+        elif choice == '4':
+            break
+        else:
+            continue
+
+if __name__ == '__main__':
+    main()
