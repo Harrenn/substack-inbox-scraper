@@ -22,7 +22,8 @@ python3 -m playwright install
 python3 play.py
 ```
 
-After installation you only need to run (make sure you are on the right directory)
+After installation you only need to run (make sure you are on the right directory by running "cd substack-inbox-scraper")
+```bash
 python3 play.py
-
+```
 
