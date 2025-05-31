@@ -5,9 +5,17 @@ Works on WSL, just install requirements and go.
 
 ## Setup
 
+Install WSL
+open windows CMD in admin and run
+```bash
+wsl --install
+```
+
+Search UBUNTU in search bar and run these on command line
 ```bash
 git clone https://github.com/Harrenn/substack-inbox-scraper.git
 cd substack-inbox-scraper
 pip install -r requirements.txt
 python -m playwright install
 python play.py
+```
